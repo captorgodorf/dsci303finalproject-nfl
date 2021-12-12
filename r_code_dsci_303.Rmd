@@ -1,0 +1,155 @@
+---
+title: "DSCI 303 Project"
+author: "Ari Vilker"
+date: "10/27/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(nflfastR)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+nfldata = load_pbp(2018)
+dim(nfldata)
+```
+
+```{r}
+NA_percentage = sapply(nfldata,function(y) sum(length(which(is.na(y)))))
+NA_percentage = NA_percentage/47874*100
+hist(NA_percentage)
+```
+
+```{r}
+drives_plot = ggplot(nfldata,aes(fixed_drive_result))+geom_histogram(stat="count")
+drives_plot
+```
+```{r}
+mytab = tabulate(as.factor(nfldata$fixed_drive_result))
+total_points = mytab[2]*3+mytab[4]*-6.95+mytab[6]*-2+mytab[7]*6.95
+drives = sum(mytab)
+total_points/drives
+```
+
+```{r}
+cleandata = read.csv('~/Documents/nfl2018clean.csv')
+cleandata = subset(cleandata,select = -c(X))
+```
+
+```{r}
+set.seed(123)
+#install.packages("rsample")
+library(rsample)
+library(recipes)
+# Assign 75% of the data to the training set.
+# Assign 25% of the data to the testing set.
+data_split= initial_split(cleandata, prop = 3/4,strata=fixed_drive_result_num)
+
+train_data <- training(data_split)
+
+test_data  <- testing(data_split)
+nrow(train_data)
+nrow(test_data)
+#colnames(newdata)
+```
+
+```{r}
+#install.packages("parsnip")
+#install.packages("tune")
+library(tune)
+library(parsnip)
+library(vip)
+library(glmnet)
+library(workflows)
+#install.packages("caret")
+library(caret)
+#install.packages("yardstick")
+library(yardstick)
+train_v_fold = vfold_cv(train_data,strata=fixed_drive_result_num)
+
+# Use the penalized linear regression model from the glmnet package
+lg_spec = linear_reg(penalty=tune())%>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+
+# Set possible values for the tuning variable
+lg_tune_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+
+# Create formula for this analysis
+lg_recipe = recipe(fixed_drive_result_num ~ total_line+down +yardline_100+away_timeouts_remaining+home_timeouts_remaining+half_seconds_remaining ,data=cleandata) %>% 
+  step_normalize(-all_outcomes()) # normalize numeric data to have a standard deviation of one and a mean of zero
+
+
+# Create a model pipeline with model specifications
+lg_workflow <- 
+  workflow() %>% 
+  add_model(lg_spec) %>% 
+  add_recipe(lg_recipe)
+
+# Tune the model
+lg_tune_results = lg_workflow %>% 
+  tune_grid(train_v_fold,
+            grid = lg_tune_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(rmse))
+
+# Visualize analysis results with different penalty values
+lg_tune_results %>% 
+  collect_metrics() %>%
+  filter (.metric=='rmse') %>%
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() +
+  scale_x_log10()
+```
+
+```{r}
+lg_tune_results %>% show_best('rmse')
+
+lg_tune_best = lg_tune_results %>%
+select_best('rmse')
+
+# Finalize the work flow
+lg_final_workflow = lg_workflow %>% finalize_workflow(lg_tune_best)
+```
+```{r}
+lg_final_workflow %>% 
+  fit(train_data) %>%
+  extract_fit_parsnip() %>% 
+  vip()
+```
+
+```{r}
+lg_final_results = lg_final_workflow %>% last_fit(data_split)
+
+# Show evaluation metrics
+lg_final_results %>% collect_metrics()
+```
+
+```{r}
+set.seed(234)
+lg_model = lg_final_workflow %>% fit(cleandata)
+
+lg_prediction = stats::predict(lg_model, cleandata) %>% 
+  bind_cols(cleandata %>% select(total_line,down,yardline_100,away_timeouts_remaining,home_timeouts_remaining,half_seconds_remaining,fixed_drive_result_num))
+```
+
+```{r}
+head(lg_prediction)
+```
+
+```{r}
+error = mean(abs(lg_prediction$.pred-lg_prediction$fixed_drive_result_num))
+```
+
+```{r}
+first_drive = lg_prediction[c(1:12),]
+ggplot(data=first_drive,aes(x=half_seconds_remaining,y=.pred))+geom_line()+scale_x_reverse()+xlab("Seconds Remaining")+ylab("Expected Points")+ggtitle("Sample Drive")
+```
+
+
